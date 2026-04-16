@@ -19,6 +19,9 @@ import hashlib
 import threading
 from pathlib import Path
 from typing import Optional, Dict, Any
+from urllib.parse import parse_qsl, urlencode, urlsplit
+
+import requests
 
 # 添加项目根目录到路径
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -73,6 +76,9 @@ VIDEO_CACHE_DIR = BASE_DIR / ".video_cache"
 VIDEO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 _video_cache_lock = threading.Lock()
 _video_cache_key_locks: Dict[str, threading.Lock] = {}
+VIDEO_TRANSFORM_VERSION = "framing-v3"
+VIDEO_FACE_SCALE = 0.70
+VIDEO_FACE_VERTICAL_SHIFT = 80
 
 
 class AgeVerificationService:
@@ -128,11 +134,11 @@ class AgeVerificationService:
         self._temp_files = []  # 临时文件列表，用于清理
 
     def _prepare_video_file(self, video_file: str, apply_position_shift: bool = True) -> str:
-        """准备视频文件 (转码为 Y4M 并应用位置调整)
+        """准备视频文件 (转码为 Y4M 并应用扫脸构图修正)
 
         Args:
             video_file: 原始视频文件路径
-            apply_position_shift: 是否应用摄像机位置调整（向上移动）
+            apply_position_shift: 是否应用扫脸构图修正（缩小并轻微下移前景）
         """
         if not video_file or not os.path.exists(video_file):
             return video_file
@@ -149,7 +155,10 @@ class AgeVerificationService:
 
         source_path = Path(video_file).resolve()
         stat = source_path.stat()
-        cache_fingerprint = f"{source_path}|{stat.st_size}|{stat.st_mtime_ns}|shift={int(apply_position_shift)}"
+        cache_fingerprint = (
+            f"{source_path}|{stat.st_size}|{stat.st_mtime_ns}|shift={int(apply_position_shift)}"
+            f"|transform={VIDEO_TRANSFORM_VERSION}"
+        )
         cache_key = hashlib.sha256(cache_fingerprint.encode("utf-8")).hexdigest()[:20]
         cache_path = VIDEO_CACHE_DIR / f"{cache_key}.y4m"
 
@@ -163,29 +172,42 @@ class AgeVerificationService:
                 return str(cache_path)
 
             print(f"[AgeVerify] 正在处理视频文件 ({ext})...")
-            print(f"[AgeVerify] 位置调整: {'启用 (向上移动300像素)' if apply_position_shift else '禁用'}")
+            print(
+                "[AgeVerify] 构图修正: "
+                + (
+                    f"启用 (scale={VIDEO_FACE_SCALE:.2f}, vertical_shift={VIDEO_FACE_VERTICAL_SHIFT}px)"
+                    if apply_position_shift
+                    else "禁用"
+                )
+            )
             try:
                 fd, temp_path = tempfile.mkstemp(suffix='.y4m', dir=str(VIDEO_CACHE_DIR))
                 os.close(fd)
 
-                # 位置调整滤镜说明：
-                # crop=iw:ih-300:0:0 - 先裁掉底部300像素
-                # pad=iw:ih+300:0:300:black - 在顶部添加300像素黑边，恢复原始高度
-                # 效果：视频内容向下移动300像素（相当于相机向上移动300像素）
                 if apply_position_shift:
-                    vf_filter = 'crop=iw:ih-300:0:0,pad=iw:ih+300:0:300:black,format=yuv420p'
+                    # PrivateID 的年龄估计页会根据脸在取景框中的占比给出 "Please move back"。
+                    # 这里不再简单裁切补黑边，而是把原视频缩小后叠到模糊背景上，
+                    # 同时轻微下移，让头顶和下巴都更稳定地落在扫描圆框里。
+                    vf_filter = (
+                        "split=2[base][fg];"
+                        "[base]boxblur=20:8[bg];"
+                        f"[fg]scale=trunc(iw*{VIDEO_FACE_SCALE:.2f}/2)*2:trunc(ih*{VIDEO_FACE_SCALE:.2f}/2)*2[fgs];"
+                        f"[bg][fgs]overlay=(W-w)/2:(H-h)/2+{VIDEO_FACE_VERTICAL_SHIFT},format=yuv420p"
+                    )
+                    filter_flag = "-filter_complex"
                 else:
                     vf_filter = 'format=yuv420p'
+                    filter_flag = "-vf"
 
                 cmd = [
                     'ffmpeg', '-y',
                     '-i', str(source_path),
-                    '-vf', vf_filter,
+                    filter_flag, vf_filter,
                     '-pix_fmt', 'yuv420p',
                     temp_path
                 ]
 
-                print(f"[AgeVerify] FFmpeg 滤镜: {vf_filter}")
+                print(f"[AgeVerify] FFmpeg {filter_flag}: {vf_filter}")
                 subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
                 # 原子替换，避免并发读到半文件
@@ -375,8 +397,44 @@ class AgeVerificationService:
             device_scale_factor=self.device_config["device_scale_factor"],
             is_mobile=self.device_config["is_mobile"],
             has_touch=self.device_config["has_touch"],
-            permissions=["camera", "microphone"],
+            permissions=["camera", "microphone", "clipboard-read", "clipboard-write"],
             ignore_https_errors=True,
+            locale="en-US",
+        )
+
+        await self.context.add_init_script(
+            """
+            (() => {
+              window.__ageVerifyClipboard = window.__ageVerifyClipboard || '';
+
+              const remember = (value) => {
+                if (typeof value === 'string' && value.trim()) {
+                  window.__ageVerifyClipboard = value.trim();
+                }
+              };
+
+              document.addEventListener('copy', (event) => {
+                try {
+                  const text = event.clipboardData && event.clipboardData.getData
+                    ? event.clipboardData.getData('text/plain')
+                    : '';
+                  remember(text);
+                } catch (error) {}
+              }, true);
+
+              if (navigator.clipboard && navigator.clipboard.writeText) {
+                const originalWriteText = navigator.clipboard.writeText.bind(navigator.clipboard);
+                navigator.clipboard.writeText = async (value) => {
+                  remember(value);
+                  try {
+                    return await originalWriteText(value);
+                  } catch (error) {
+                    return Promise.resolve();
+                  }
+                };
+              }
+            })();
+            """
         )
 
         # 注入摄像头伪装脚本 (仅在 OBS 模式下需要，已禁用)
@@ -426,12 +484,36 @@ class AgeVerificationService:
         button_configs = [
             {
                 "selectors": [
+                    'button:has-text("Link")',
+                    '[role="button"]:has-text("Link")',
+                    'a:has-text("Link")',
+                    'button:has-text("Open link")',
+                    '[role="button"]:has-text("Open link")',
+                    'a:has-text("Open link")',
+                    'button:has-text("Continue on this device")',
+                    '[role="button"]:has-text("Continue on this device")',
+                    'a:has-text("Continue on this device")',
+                ],
+                "name": "Link",
+                "wait_after": 1.5,
+            },
+            {
+                "selectors": [
                     'button:has-text("Agree and Continue")',
                     'button:has-text("Agree & Continue")',
+                    '[role="button"]:has-text("Agree and Continue")',
+                    '[role="button"]:has-text("Agree & Continue")',
+                    'input[type="button"][value*="Agree"]',
+                    'input[type="submit"][value*="Agree"]',
                     'button:has-text("同意并继续")',
+                    'button:has-text("Đồng ý và tiếp tục")',
+                    'button:has-text("Đồng ý")',
                     '[data-testid="agree-button"]',
                     'button.agree-button',
                     'button[type="submit"]:has-text("Agree")',
+                    '[role="button"]:has-text("Agree")',
+                    'button:has-text("Agree")',
+                    '[aria-label*="Agree"]',
                 ],
                 "name": "Agree and Continue",
                 "wait_after": 2.5,
@@ -439,8 +521,13 @@ class AgeVerificationService:
             {
                 "selectors": [
                     'button:has-text("Start")',
+                    '[role="button"]:has-text("Start")',
                     'button:has-text("开始")',
+                    'button:has-text("Bắt đầu")',
                     'button:has-text("Begin")',
+                    '[role="button"]:has-text("Begin")',
+                    'input[type="button"][value*="Start"]',
+                    'input[type="submit"][value*="Start"]',
                     '[data-testid="start-button"]',
                     'button.start-button',
                     '#start',
@@ -451,9 +538,13 @@ class AgeVerificationService:
             {
                 "selectors": [
                     'button:has-text("Continue")',
+                    '[role="button"]:has-text("Continue")',
                     'button:has-text("继续")',
+                    'button:has-text("Tiếp tục")',
                     'button:has-text("Next")',
                     'button:has-text("下一步")',
+                    'input[type="button"][value*="Continue"]',
+                    'input[type="submit"][value*="Continue"]',
                 ],
                 "name": "Continue",
                 "wait_after": 1.0,
@@ -461,8 +552,13 @@ class AgeVerificationService:
             {
                 "selectors": [
                     'button:has-text("Allow")',
+                    '[role="button"]:has-text("Allow")',
                     'button:has-text("允许")',
+                    'button:has-text("Cho phép")',
                     'button:has-text("Grant Access")',
+                    '[role="button"]:has-text("Grant Access")',
+                    'input[type="button"][value*="Allow"]',
+                    'input[type="submit"][value*="Allow"]',
                 ],
                 "name": "Allow",
                 "wait_after": 1.0,
@@ -478,20 +574,244 @@ class AgeVerificationService:
         log("等待页面加载完成...")
         await asyncio.sleep(1)
 
-        # 尝试等待第一个按钮出现
-        try:
-            first_btn = self.page.locator('button:has-text("Agree")').first
-            await first_btn.wait_for(state="visible", timeout=10000)
-            log("检测到 Agree 按钮")
-        except Exception as e:
-            log(f"未能等待到 Agree 按钮: {e}")
-            # 截图以便调试
+        async def _iter_frames():
+            for frame in self.page.frames:
+                yield frame
+
+        async def _extract_companion_handoff_url() -> str:
+            """Best-effort extraction of the mobile handoff URL from clipboard or DOM."""
+            try:
+                return await self.page.evaluate(
+                    """
+                    () => {
+                      const candidates = [];
+                      if (window.__ageVerifyClipboard) {
+                        candidates.push(window.__ageVerifyClipboard);
+                      }
+
+                      const text = document.body ? document.body.innerText : '';
+                      candidates.push(text);
+
+                      for (const el of document.querySelectorAll('a, input, textarea')) {
+                        const href = el.getAttribute && el.getAttribute('href');
+                        const value = 'value' in el ? el.value : '';
+                        const textContent = (el.innerText || el.textContent || '').trim();
+                        if (href) candidates.push(href);
+                        if (value) candidates.push(value);
+                        if (textContent) candidates.push(textContent);
+                      }
+
+                      const patterns = [
+                        /https?:\\/\\/[^\\s"'<>]*\\/handoff-age\\?handoffId=[A-Za-z0-9-]+[^\\s"'<>]*/i,
+                        /https?:\\/\\/[^\\s"'<>]*\\/handoff\\?handoffId=[A-Za-z0-9-]+/i,
+                        /https?:\\/\\/[^\\s"'<>]*\\/mobile-flow[^\\s"'<>]*/i,
+                        /\\/handoff-age\\?handoffId=[A-Za-z0-9-]+[^\\s"'<>]*/i,
+                        /\\/handoff\\?handoffId=[A-Za-z0-9-]+/i,
+                        /\\/mobile-flow[^\\s"'<>]*/i,
+                      ];
+
+                      for (const raw of candidates) {
+                        if (typeof raw !== 'string' || !raw.trim()) continue;
+                        for (const pattern of patterns) {
+                          const match = raw.match(pattern);
+                          if (match) return match[0];
+                        }
+                      }
+
+                      return '';
+                    }
+                    """
+                )
+            except Exception:
+                return ""
+
+        async def _create_companion_handoff_via_api(current_url: str) -> str:
+            """Create an age-verification handoff directly from the backend API."""
+            parsed = urlsplit(current_url)
+            params = parse_qsl(parsed.query, keep_blank_values=True)
+            session_id = next((value for key, value in params if key == "sessionId" and value), "")
+            if not session_id:
+                return ""
+
+            api_url = f"https://api-age-verification.privateid.com/session/{session_id}/handoff"
+            try:
+                response = requests.post(
+                    api_url,
+                    json={"type": "QR_CODE"},
+                    headers={"content-type": "application/json"},
+                    timeout=20,
+                )
+            except Exception as e:
+                log(f"companion API 创建 handoff 失败: {e}")
+                return ""
+
+            if response.status_code >= 400:
+                log(
+                    "companion API 创建 handoff 失败: "
+                    f"status={response.status_code} body={response.text[:240]}"
+                )
+                return ""
+
+            try:
+                data = response.json()
+            except Exception as e:
+                log(f"companion API 响应 JSON 解析失败: {e}")
+                return ""
+
+            handoff_id = data.get("id")
+            if not handoff_id:
+                log(f"companion API 未返回 handoff id: {str(data)[:240]}")
+                return ""
+
+            handoff_params = [(key, value) for key, value in params if key != "sessionId"]
+            handoff_params.append(("handoffId", handoff_id))
+            handoff_query = urlencode(handoff_params)
+            origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else "https://age-verification.privateid.com"
+            return f"{origin}/handoff-age?{handoff_query}" if handoff_query else f"{origin}/handoff-age"
+
+        async def _activate_companion_link_flow(current_url: str, current_text: str) -> bool:
+            """Switch companion page to link mode and navigate to the generated mobile link."""
+            if "switch-device-age" not in current_url:
+                return False
+            text_lower = current_text.lower()
+            if not any(phrase in text_lower for phrase in [
+                "use your phone",          # English
+                "sử dụng điện thoại",      # Vietnamese
+                "使用您的手机",             # Chinese
+                "ใช้โทรศัพท์",             # Thai
+                "gunakan ponsel",          # Indonesian
+            ]):
+                return False
+
+            direct_handoff_url = await _create_companion_handoff_via_api(current_url)
+            if direct_handoff_url:
+                log(f"通过 companion API 生成 handoff 链接: {direct_handoff_url}")
+                await self.page.goto(direct_handoff_url, wait_until="domcontentloaded", timeout=30000)
+                clicked_buttons.append("Companion handoff api")
+                return True
+
+            try:
+                switched = await self.page.evaluate(
+                    """
+                    () => {
+                      const clickLikeUser = (el) => {
+                        if (!el) return false;
+                        const events = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+                        for (const type of events) {
+                          el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                        }
+                        return true;
+                      };
+
+                      const buttons = Array.from(document.querySelectorAll('button, [role="button"], a'));
+                      const linkTab = buttons.find((el) => {
+                        const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                        return text === 'link' || text === 'open link' || text === 'continue on this device';
+                      });
+                      if (!clickLikeUser(linkTab)) return { switched: false, copyClicked: false };
+
+                      const copyButton = buttons.find((el) => {
+                        const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                        return text === 'copy link' || text === 'open link' || text === 'continue on this device';
+                      });
+
+                      if (copyButton) {
+                        clickLikeUser(copyButton);
+                      }
+
+                      const activeTab = buttons.find((el) => (el.getAttribute('data-state') || '').toLowerCase() === 'active');
+                      return {
+                        switched: true,
+                        copyClicked: !!copyButton,
+                        activeTabText: activeTab ? (activeTab.innerText || activeTab.textContent || '').trim() : '',
+                      };
+                    }
+                    """
+                )
+            except Exception as e:
+                log(f"检测 companion Link 模式失败: {e}")
+                return False
+
+            if switched and switched.get("switched"):
+                log(
+                    "检测到 companion 页，已切换到 Link tab"
+                    + (f" (active={switched.get('activeTabText', '')})" if switched.get("activeTabText") else "")
+                )
+                if switched.get("copyClicked"):
+                    log("检测到 companion 页，已点击 Copy/Open Link 按钮")
+
+                await asyncio.sleep(1.2)
+                handoff_url = await _extract_companion_handoff_url()
+                if handoff_url:
+                    if handoff_url.startswith("/"):
+                        handoff_url = f"{self.page.url.split('/switch-device-age')[0]}{handoff_url}"
+                    log(f"检测到 handoff 链接，直接跳转: {handoff_url}")
+                    await self.page.goto(handoff_url, wait_until="domcontentloaded", timeout=30000)
+                    clicked_buttons.append("Companion handoff")
+                    return True
+
+                log("Link tab 已激活，但暂未提取到 handoff 链接")
+                clicked_buttons.append("Link")
+                return True
+
+            return False
+
+        async def _log_page_diagnostics(prefix: str):
+            try:
+                log(f"{prefix} 当前 URL: {self.page.url}")
+            except Exception:
+                pass
+
+            for idx, frame in enumerate(self.page.frames):
+                try:
+                    frame_url = frame.url
+                except Exception:
+                    frame_url = "<unknown>"
+                try:
+                    frame_text = await frame.evaluate("document.body ? document.body.innerText : ''")
+                    frame_text = " ".join(frame_text.split())[:300]
+                except Exception:
+                    frame_text = ""
+                try:
+                    candidates = await frame.evaluate(
+                        """
+                        () => Array.from(document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"], a'))
+                          .map((el) => ({
+                            tag: el.tagName,
+                            text: (el.innerText || el.value || el.getAttribute('aria-label') || '').trim(),
+                            href: el.getAttribute('href') || '',
+                            id: el.id || '',
+                            cls: el.className || '',
+                            visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length),
+                            disabled: !!el.disabled
+                          }))
+                          .filter((item) => item.text || item.id || item.cls)
+                          .slice(0, 12)
+                        """
+                    )
+                except Exception:
+                    candidates = []
+                log(
+                    f"{prefix} frame[{idx}] url={frame_url[:160]} text={frame_text[:160]} "
+                    f"candidates={candidates}"
+                )
+
             if self.debug_screenshots:
                 try:
-                    await self.page.screenshot(path="debug_no_agree_button.png")
-                    log("已保存截图: debug_no_agree_button.png")
-                except:
+                    screenshot_path = f"debug_no_button_{int(asyncio.get_event_loop().time())}.png"
+                    await self.page.screenshot(path=screenshot_path)
+                    log(f"{prefix} 已保存截图: {screenshot_path}")
+                except Exception:
                     pass
+
+        # 尝试等待第一个按钮出现
+        try:
+            first_btn = self.page.locator('button:has-text("Agree"), [role="button"]:has-text("Agree"), button:has-text("Continue"), [role="button"]:has-text("Continue")').first
+            await first_btn.wait_for(state="visible", timeout=10000)
+            log("检测到首个操作按钮")
+        except Exception as e:
+            log(f"未能等待到首个操作按钮: {e}")
+            await _log_page_diagnostics("按钮预检失败")
 
         while attempt < max_attempts:
             attempt += 1
@@ -506,6 +826,19 @@ class AgeVerificationService:
             except Exception as e:
                 pass  # 页面可能正在加载，忽略错误
 
+            # switch-device-age 伴随页在当前版本里经常停留在 QR tab。
+            # 先显式切到 Link tab，再让后续通用按钮逻辑继续跑。
+            try:
+                current_text = await self.page.evaluate("document.body ? document.body.innerText : ''")
+                if await _activate_companion_link_flow(current_url, current_text):
+                    clicked_this_round = True
+                    await asyncio.sleep(1.0)
+            except Exception:
+                pass
+
+            if clicked_this_round:
+                continue
+
             for config in button_configs:
                 # 检查是否连续点击过多
                 btn_name = config["name"]
@@ -515,39 +848,39 @@ class AgeVerificationService:
                     else:
                         continue
 
-                for selector in config["selectors"]:
-                    try:
-                        btn = self.page.locator(selector).first
-                        # 增加可见性检测超时到 1 秒
-                        if await btn.is_visible(timeout=1000):
-                            is_disabled = await btn.is_disabled()
-                            if not is_disabled:
-                                await btn.click()
-                                log(f"点击按钮: {config['name']} (选择器: {selector})")
+                async for frame in _iter_frames():
+                    for selector in config["selectors"]:
+                        try:
+                            btn = frame.locator(selector).first
+                            if await btn.is_visible(timeout=1000):
+                                is_disabled = await btn.is_disabled()
+                                if not is_disabled:
+                                    await btn.click()
+                                    log(
+                                        f"点击按钮: {config['name']} "
+                                        f"(frame={frame.url[:120]}, 选择器: {selector})"
+                                    )
 
-                                # 更新统计
-                                clicked_buttons.append(config['name'])
-                                clicked_this_round = True
+                                    clicked_buttons.append(config['name'])
+                                    clicked_this_round = True
 
-                                # 更新连续点击计数
-                                for k in consecutive_clicks:
-                                    consecutive_clicks[k] = 0 # 重置其他按钮
-                                consecutive_clicks[btn_name] = consecutive_clicks.get(btn_name, 0) + 1
+                                    for k in consecutive_clicks:
+                                        consecutive_clicks[k] = 0
+                                    consecutive_clicks[btn_name] = consecutive_clicks.get(btn_name, 0) + 1
 
-                                # 截图记录点击后的状态
-                                if self.debug_screenshots:
-                                    try:
-                                        screenshot_path = f"debug_click_{len(clicked_buttons)}_{btn_name.replace(' ', '_')}.png"
-                                        await self.page.screenshot(path=screenshot_path)
-                                        # log(f"已保存截图: {screenshot_path}") # 避免刷屏
-                                    except:
-                                        pass
+                                    if self.debug_screenshots:
+                                        try:
+                                            screenshot_path = f"debug_click_{len(clicked_buttons)}_{btn_name.replace(' ', '_')}.png"
+                                            await self.page.screenshot(path=screenshot_path)
+                                        except Exception:
+                                            pass
 
-                                await asyncio.sleep(config["wait_after"])
-                                break
-                    except Exception as e:
-                        # 只在调试时记录详细错误
-                        pass
+                                    await asyncio.sleep(config["wait_after"])
+                                    break
+                        except Exception:
+                            pass
+                    if clicked_this_round:
+                        break
                 if clicked_this_round:
                     break
 
@@ -567,6 +900,9 @@ class AgeVerificationService:
                         pass
 
                 # 放宽早期退出条件
+                if attempt in (5, 10, 15):
+                    await _log_page_diagnostics(f"第 {attempt} 次轮询仍未点到按钮")
+
                 if attempt >= 15 and not clicked_buttons:
                     log(f"{attempt} 次尝试后未找到任何按钮，退出")
                     break
