@@ -645,14 +645,19 @@ def verify_single():
     print(f"DEBUG: 请求数据: {data}")
     print(f"DEBUG: 请求传入的 video_file: {video_file}")
 
-    # 总是尝试加载默认视频，如果未提供视频文件
+    # 总是尝试加载默认视频，如果未提供视频文件或传入路径不存在
     # 即使 use_obs 为 True，由于服务层强制使用视频注入，我们也需要一个视频文件
+    if video_file and not os.path.exists(video_file):
+        print(f"DEBUG: 传入的 video_file 不存在，回退默认视频: {video_file}")
+        video_file = None
+
     if not video_file:
         # 优先查找当前目录下的默认视频，兼容 Linux/Windows
-        default_video_name = "546a131c1b386aa2856940da0f8737b2.mp4"
+        default_video_name = "face_video.mp4"
         possible_paths = [
             os.path.join(BASE_DIR, default_video_name),
             os.path.abspath(default_video_name),
+            os.path.join(BASE_DIR, "546a131c1b386aa2856940da0f8737b2.mp4"),
             r"F:\SHIRO_Object\google_tools\age_verification_project\546a131c1b386aa2856940da0f8737b2.mp4" # 保留旧路径作为后备
         ]
 
